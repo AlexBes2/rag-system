@@ -1,0 +1,13 @@
+qdrant-client
+requests
+python-multipart
+pypdf
+python-docx
+langchain-text-splitters
+tiktoken
+fastapi
+uvicorn[standard]
+python-dotenv
+pytesseract
+pdf2image
+Pillow
