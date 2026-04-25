@@ -13,7 +13,10 @@ from backend.services.qdrant_service import search_similar_chunks
 router = APIRouter(tags=["query"])
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
+OLLAMA_MODEL = os.getenv(
+    "OLLAMA_MODEL",
+    os.getenv("OLLAMA_LLM_MODEL", "llama3"),
+)
 BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://127.0.0.1:8000")
 
 ANSWER_NOT_FOUND_MARKERS = [

@@ -7,6 +7,7 @@ from fastapi.staticfiles import StaticFiles
 from backend.api.upload import router as upload_router
 from backend.api.query import router as query_router
 from backend.api.documents import router as documents_router
+from backend.core.config import settings
 
 app = FastAPI(title="RAG System API")
 
@@ -25,7 +26,7 @@ app.include_router(upload_router)
 app.include_router(query_router)
 app.include_router(documents_router)
 
-uploads_dir = Path("data/uploads")
+uploads_dir = Path(settings.upload_dir)
 uploads_dir.mkdir(parents=True, exist_ok=True)
 
 app.mount("/files", StaticFiles(directory=str(uploads_dir)), name="files")
