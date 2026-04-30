@@ -1,0 +1,8 @@
+services:
+  backend:
+    environment:
+      COLLECTION_NAME: demo_documents
+      QDRANT_PATH: data/demo_qdrant
+      UPLOAD_DIR: data/demo_uploads
+      CHUNK_SIZE: 800
+      CHUNK_OVERLAP: 120

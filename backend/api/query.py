@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from functools import lru_cache
 from typing import Any
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -8,7 +9,10 @@ from urllib.request import Request, urlopen
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from backend.services.qdrant_service import search_similar_chunks
+from backend.services.qdrant_service import (
+    find_documents_containing_text,
+    search_similar_chunks,
+)
 
 router = APIRouter(tags=["query"])
 
@@ -27,6 +31,220 @@ ANSWER_NOT_FOUND_MARKERS = [
     "exact answer was not found",
     "exact answer not found",
 ]
+
+TITLE_LOOKUP_MARKERS = [
+    "documents that contain the title",
+    "documents containing the title",
+    "documents with the title",
+    "files that contain the title",
+    "files containing the title",
+    "files with the title",
+    "find all documents",
+    "find all files",
+]
+
+TEXT_LOOKUP_MARKERS = [
+    "documents that contain the text",
+    "documents containing the text",
+    "documents with the text",
+    "files that contain the text",
+    "files containing the text",
+    "files with the text",
+    "file with text",
+    "files with text",
+    "find file with text",
+    "find files with text",
+    "find files containing text",
+    "find files that contain text",
+    "contain the text",
+    "contains the text",
+    "containing the text",
+]
+
+CONTEXT_ACRONYMS = (
+    "AI",
+    "BERT",
+    "FinBERT",
+    "LLM",
+    "LLMs",
+    "LVLM",
+    "LVLMs",
+    "MLLM",
+    "MLLMs",
+    "RAG",
+    "VLM",
+    "VLMs",
+    "VQA",
+)
+
+GLUED_WORDS = {
+    "a",
+    "ablations",
+    "abstract",
+    "accuracy",
+    "across",
+    "again",
+    "against",
+    "all",
+    "agent",
+    "agents",
+    "aim",
+    "aims",
+    "already",
+    "also",
+    "an",
+    "and",
+    "answer",
+    "architecture",
+    "as",
+    "at",
+    "based",
+    "benchmark",
+    "between",
+    "by",
+    "candidate",
+    "can",
+    "chunk",
+    "chunks",
+    "components",
+    "completely",
+    "con",
+    "condition",
+    "confirm",
+    "context",
+    "contribution",
+    "contributions",
+    "data",
+    "dataset",
+    "dense",
+    "document",
+    "documents",
+    "dominant",
+    "discards",
+    "effect",
+    "embedding",
+    "embeddings",
+    "eliminating",
+    "external",
+    "factual",
+    "for",
+    "formalize",
+    "from",
+    "full",
+    "fundamental",
+    "generate",
+    "generation",
+    "has",
+    "hidden",
+    "improve",
+    "in",
+    "index",
+    "ineffect",
+    "information",
+    "inference",
+    "internal",
+    "introduces",
+    "is",
+    "it",
+    "knowledge",
+    "large",
+    "layer",
+    "layers",
+    "learning",
+    "loss",
+    "main",
+    "method",
+    "model",
+    "models",
+    "native",
+    "of",
+    "on",
+    "only",
+    "approximate",
+    "paradigm",
+    "pipeline",
+    "processed",
+    "projection",
+    "propose",
+    "query",
+    "quality",
+    "rag",
+    "reasoning",
+    "redundancy",
+    "retrieval",
+    "retrieve",
+    "search",
+    "semantic",
+    "sessed",
+    "standard",
+    "state",
+    "states",
+    "system",
+    "systematic",
+    "text",
+    "that",
+    "the",
+    "then",
+    "this",
+    "three",
+    "to",
+    "two",
+    "typically",
+    "understanding",
+    "via",
+    "vector",
+    "while",
+    "with",
+}
+
+SNIPPET_GLUED_WORDS = {
+    "adaptation",
+    "aluminum",
+    "annotated",
+    "alone",
+    "called",
+    "can",
+    "classify",
+    "closest",
+    "compared",
+    "compare",
+    "datasets",
+    "document",
+    "expert",
+    "financial",
+    "finbert",
+    "forecasting",
+    "including",
+    "indexed",
+    "investigate",
+    "learn",
+    "learning",
+    "lexicon",
+    "lightweight",
+    "matched",
+    "llm",
+    "models",
+    "news",
+    "numerical",
+    "predicted",
+    "prices",
+    "question",
+    "qwen",
+    "scores",
+    "sentences",
+    "sentiment",
+    "series",
+    "techniques",
+    "time",
+    "use",
+    "using",
+    "we",
+}
+
+WORD_LIST_PATHS = (
+    "/usr/share/dict/words",
+    "/usr/share/dict/web2",
+)
 
 STOPWORDS = {
     "the", "a", "an", "is", "are", "was", "were", "to", "of", "and", "or", "in",
@@ -51,6 +269,9 @@ class SourceItem(BaseModel):
     page: int | None = None
     chunk_id: str | int | None = None
     file_url: str | None = None
+    snippet: str | None = None
+    score: float | None = None
+    match_type: str | None = None
 
 
 class QueryResponse(BaseModel):
@@ -69,6 +290,7 @@ def run_search(question: str, k: int) -> list[dict[str, Any]]:
         )
 
     attempts = [
+        {"question": question, "limit": k},
         {"question": question, "k": k},
         {"query": question, "k": k},
         {"query_text": question, "k": k},
@@ -152,11 +374,329 @@ def extract_chunk_id(item: dict[str, Any]) -> str | int | None:
     )
 
 
+def extract_score(item: dict[str, Any]) -> float | None:
+    score = item.get("score")
+    if score is None:
+        return None
+
+    try:
+        return round(float(score), 4)
+    except (TypeError, ValueError):
+        return None
+
+
+def extract_match_type(item: dict[str, Any]) -> str | None:
+    match_type = item.get("match_type")
+    if match_type is None:
+        return None
+    return str(match_type)
+
+
+def build_file_url(document_name: str) -> str:
+    return f"{BACKEND_BASE_URL}/files/{quote(document_name)}"
+
+
+def build_snippet(text: str, max_chars: int = 360) -> str | None:
+    text = improve_context_readability(text, min_glued_len=6)
+    text = re.sub(r"\s+", " ", text or "").strip()
+    if not text:
+        return None
+    if has_unreadable_glued_artifacts(text):
+        return None
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "..."
+
+
+def build_source_item(item: dict[str, Any]) -> SourceItem:
+    document_name = extract_document_name(item)
+    return SourceItem(
+        document_name=document_name,
+        page=extract_page(item),
+        chunk_id=extract_chunk_id(item),
+        file_url=build_file_url(document_name),
+        snippet=build_snippet(extract_text(item)),
+        score=extract_score(item),
+        match_type=extract_match_type(item),
+    )
+
+
+def extract_quoted_title(question: str) -> str | None:
+    quoted = re.findall(r'"([^"]{3,})"|\'([^\']{3,})\'', question or "")
+    for pair in quoted:
+        for item in pair:
+            item = item.strip()
+            if item:
+                return item
+    return None
+
+
+def is_title_lookup_question(question: str) -> bool:
+    normalized = normalize_for_match(question)
+    if "title" not in normalized:
+        return False
+    if extract_quoted_title(question) is None:
+        return False
+    return any(marker in normalized for marker in TITLE_LOOKUP_MARKERS)
+
+
+def is_text_lookup_question(question: str) -> bool:
+    normalized = normalize_for_match(question)
+    if "text" not in normalized:
+        return False
+    if extract_quoted_title(question) is None:
+        return False
+    return any(marker in normalized for marker in TEXT_LOOKUP_MARKERS)
+
+
+def lookup_target_label(question: str) -> str:
+    normalized = normalize_for_match(question)
+    if "file" in normalized:
+        return "file"
+    return "document"
+
+
+def build_title_source(document_name: str) -> SourceItem:
+    return SourceItem(
+        document_name=document_name,
+        page=None,
+        chunk_id=None,
+        file_url=build_file_url(document_name),
+        snippet=f"Document title match: {document_name}",
+        score=1.0,
+        match_type="title",
+    )
+
+
+@lru_cache(maxsize=1)
+def glued_word_inventory() -> frozenset[str]:
+    words = set(GLUED_WORDS) | set(SNIPPET_GLUED_WORDS)
+
+    for path in WORD_LIST_PATHS:
+        try:
+            with open(path, encoding="utf-8", errors="ignore") as file:
+                for line in file:
+                    word = line.strip().lower()
+                    if re.fullmatch(r"[a-z]{2,18}", word):
+                        words.add(word)
+        except OSError:
+            continue
+
+    words.update({"a", "i"})
+    return frozenset(words)
+
+
+@lru_cache(maxsize=1)
+def preferred_glued_words() -> frozenset[str]:
+    return frozenset(set(GLUED_WORDS) | set(SNIPPET_GLUED_WORDS))
+
+
+@lru_cache(maxsize=1)
+def max_glued_word_len() -> int:
+    return max(len(word) for word in glued_word_inventory())
+
+
+def has_unreadable_glued_artifacts(text: str) -> bool:
+    sample = re.sub(r"https?://\S+|\S+@\S+", " ", text or "")
+    suspicious_tokens = re.findall(r"\b[a-z]{28,}\b", sample)
+    if not suspicious_tokens:
+        return False
+
+    known_words = glued_word_inventory()
+    return any(token.lower() not in known_words for token in suspicious_tokens)
+
+
+def build_lookup_miss_response(
+    question: str,
+    quoted_text: str,
+    lookup_label: str,
+    target_label: str,
+    k: int,
+) -> QueryResponse:
+    answer = (
+        f'No uploaded {target_label}s contain the exact {lookup_label} '
+        f'"{quoted_text}".'
+    )
+
+    if lookup_label != "text":
+        return QueryResponse(answer=answer, sources=[])
+
+    semantic_hits = run_search(quoted_text, max(k, 5))
+    if not semantic_hits:
+        return QueryResponse(answer=answer, sources=[])
+
+    sources: list[SourceItem] = []
+    seen_documents: set[str] = set()
+
+    for item in semantic_hits:
+        document_name = extract_document_name(item)
+        if document_name in seen_documents:
+            continue
+        seen_documents.add(document_name)
+        sources.append(build_source_item(item))
+        if len(sources) >= max(k, 3):
+            break
+
+    if not sources:
+        return QueryResponse(answer=answer, sources=[])
+
+    lines = "\n".join(
+        f"- {source.document_name}"
+        for source in sources
+    )
+    return QueryResponse(
+        answer=(
+            f"{answer}\n\nClosest semantic matches, not exact text matches:\n{lines}"
+        ),
+        sources=sources,
+    )
+
+
+def answer_title_lookup(question: str, k: int) -> QueryResponse | None:
+    if is_title_lookup_question(question):
+        lookup_label = "title"
+    elif is_text_lookup_question(question):
+        lookup_label = "text"
+    else:
+        return None
+
+    quoted_text = extract_quoted_title(question)
+    if not quoted_text:
+        return None
+
+    target_label = lookup_target_label(question)
+    matches = find_documents_containing_text(quoted_text, max_docs=50)
+    if not matches:
+        return build_lookup_miss_response(
+            question=question,
+            quoted_text=quoted_text,
+            lookup_label=lookup_label,
+            target_label=target_label,
+            k=k,
+        )
+
+    lines = "\n".join(
+        f"- {extract_document_name(item)}"
+        for item in matches
+    )
+    relation = "containing"
+    if lookup_label == "text" and any(
+        (extract_match_type(item) or "").startswith("near_")
+        for item in matches
+    ):
+        relation = "matching"
+
+    return QueryResponse(
+        answer=(
+            f'Found {len(matches)} uploaded {target_label}(s) {relation} the {lookup_label} '
+            f'"{quoted_text}":\n{lines}'
+        ),
+        sources=[
+            build_title_source(extract_document_name(item))
+            if extract_match_type(item) == "title"
+            else build_source_item(item)
+            for item in matches
+        ],
+    )
+
+
+def split_glued_token(token: str) -> str:
+    if len(token) < 6 or not token.isalpha():
+        return token
+
+    lower_token = token.lower()
+    if lower_token == "ineffect":
+        return "In effect" if token[0].isupper() else "in effect"
+
+    words = glued_word_inventory()
+    preferred_words = preferred_glued_words()
+
+    if lower_token in words:
+        return token
+
+    @lru_cache(maxsize=None)
+    def search(position: int) -> tuple[tuple[int, int, int], tuple[str, ...]] | None:
+        if position >= len(lower_token):
+            return (0, 0, 0), ()
+
+        best: tuple[tuple[int, int, int], tuple[str, ...]] | None = None
+        end_limit = min(len(lower_token), position + max_glued_word_len())
+
+        for end in range(end_limit, position, -1):
+            part = lower_token[position:end]
+            if part not in words:
+                continue
+
+            rest = search(end)
+            if rest is None:
+                continue
+
+            rest_score, rest_parts = rest
+            score = (
+                rest_score[0] + (0 if part in preferred_words else 1),
+                rest_score[1] + (1 if len(part) <= 2 else 0),
+                rest_score[2] + 1,
+            )
+            candidate = (score, (part, *rest_parts))
+            if best is None or candidate[0] < best[0]:
+                best = candidate
+
+        return best
+
+    result = search(0)
+    if result is None:
+        return token
+
+    _, parts = result
+    if len(parts) < 2:
+        return token
+
+    split_text = " ".join(parts)
+    if token[0].isupper():
+        split_text = split_text[:1].upper() + split_text[1:]
+
+    return split_text
+
+
+def split_glued_words(text: str, min_len: int = 8) -> str:
+    return re.sub(
+        rf"\b[A-Za-z]{{{min_len},}}\b",
+        lambda match: split_glued_token(match.group(0)),
+        text,
+    )
+
+
+def improve_context_readability(text: str, min_glued_len: int = 8) -> str:
+    text = text or ""
+    text = text.replace("\u00a0", " ").replace("\u00ad", "")
+    text = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", text)
+    text = re.sub(r"(?<=[A-Za-z])(?=\d)", " ", text)
+    text = re.sub(r"(?<=\d)(?=[A-Za-z])", " ", text)
+    text = re.sub(r"(?<=[A-Za-z0-9])\.(?=[A-Z])", ". ", text)
+    text = re.sub(r"(?<=[A-Za-z0-9])\((?=[A-Za-z0-9])", " (", text)
+    text = re.sub(r"(?<=[A-Za-z0-9])\)(?=[A-Za-z])", ") ", text)
+    text = re.sub(r"(?<=[,;:])(?=\S)", " ", text)
+    text = re.sub(r"\s+", " ", text)
+
+    for acronym in sorted(CONTEXT_ACRONYMS, key=len, reverse=True):
+        plural_guard = "(?!s)" if acronym in {"LLM", "LVLM", "MLLM", "VLM"} else ""
+        text = re.sub(
+            rf"\b({re.escape(acronym)}){plural_guard}(?=[a-z])",
+            r"\1 ",
+            text,
+        )
+
+    text = split_glued_words(text, min_len=min_glued_len)
+    text = re.sub(r"\b[Ff]in\s+BERT\b", "FinBERT", text)
+    text = re.sub(r"\bIn effect\b", "In effect", text)
+    return text.strip()
+
+
 def build_prompt(question: str, chunks: list[dict[str, Any]]) -> str:
     context_parts = []
 
     for index, item in enumerate(chunks, start=1):
-        text = extract_text(item)
+        text = improve_context_readability(extract_text(item))
         document_name = extract_document_name(item)
         page = extract_page(item)
 
@@ -173,8 +713,12 @@ def build_prompt(question: str, chunks: list[dict[str, Any]]) -> str:
 
     return f"""
 Ты помощник для RAG-системы.
-Отвечай только по контексту ниже.
-Если в контексте нет точного ответа, честно скажи: "В загруженных документах точного ответа не найдено."
+Отвечай только по контексту ниже и не добавляй факты извне.
+Отвечай на языке вопроса.
+Для вопросов про authors/авторов перечисляй только имена авторов, убирая номера аффилиаций и служебные символы.
+Если вопрос про contribution/main contribution/вклад, не считай имена авторов, университеты и email вкладом статьи.
+Для вопросов summary/problem/method/lessons можно делать краткий вывод из abstract, introduction, contributions и conclusion, если это поддержано контекстом.
+Если релевантной информации в контексте нет, честно скажи: "В загруженных документах точного ответа не найдено."
 
 Вопрос:
 {question}
@@ -191,6 +735,10 @@ def call_ollama(prompt: str) -> str:
         "model": OLLAMA_MODEL,
         "prompt": prompt,
         "stream": False,
+        "options": {
+            "temperature": 0,
+            "top_p": 0.9,
+        },
     }
 
     request = Request(
@@ -369,50 +917,17 @@ def build_sources_from_supported_chunks(
             continue
         seen_pages.add(key)
 
-        file_url = f"{BACKEND_BASE_URL}/files/{quote(document_name)}"
-
-        sources.append(
-            SourceItem(
-                document_name=document_name,
-                page=page,
-                chunk_id=chunk_id,
-                file_url=file_url,
-            )
-        )
+        sources.append(build_source_item(item))
 
     return sources
 
 
-# @router.post("/query", response_model=QueryResponse)
-# def query_documents(payload: QueryRequest):
-    question = payload.question.strip()
-    if not question:
-        raise HTTPException(status_code=400, detail="Вопрос не должен быть пустым")
-
-    search_results = run_search(question=question, k=payload.k)
-
-    if not search_results:
-        return QueryResponse(
-            answer="Не удалось найти подходящие фрагменты в документах.",
-            sources=[],
-        )
-
-    prompt = build_prompt(question=question, chunks=search_results)
-    answer = call_ollama(prompt)
-    answer = answer or "Модель не вернула текст ответа."
-
-    sources = build_sources_from_supported_chunks(
-        search_results=search_results,
-        answer=answer,
-    )
-
-    return QueryResponse(
-        answer=answer,
-        sources=sources,
-    )
-
 @router.post("/query", response_model=QueryResponse)
 async def query_documents(request: QueryRequest) -> QueryResponse:
+    title_lookup_response = answer_title_lookup(request.question, request.k)
+    if title_lookup_response is not None:
+        return title_lookup_response
+
     chunks = run_search(request.question, request.k)
 
     if not chunks:
@@ -423,6 +938,12 @@ async def query_documents(request: QueryRequest) -> QueryResponse:
 
     prompt = build_prompt(request.question, chunks)
     answer = call_ollama(prompt)
+
+    if is_answer_not_found(answer):
+        return QueryResponse(
+            answer=answer,
+            sources=[],
+        )
 
     sources: list[SourceItem] = []
     seen = set()
@@ -437,14 +958,7 @@ async def query_documents(request: QueryRequest) -> QueryResponse:
             continue
         seen.add(key)
 
-        sources.append(
-            SourceItem(
-                document_name=document_name,
-                page=page,
-                chunk_id=chunk_id,
-                file_url=None,
-            )
-        )
+        sources.append(build_source_item(item))
 
     return QueryResponse(
         answer=answer or "В загруженных документах точного ответа не найдено.",

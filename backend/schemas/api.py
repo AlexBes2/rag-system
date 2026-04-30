@@ -24,6 +24,23 @@ class UploadResponse(BaseModel):
     message: str
 
 
+class BatchUploadItem(BaseModel):
+    filename: str
+    success: bool
+    chunks_indexed: int = 0
+    message: str | None = None
+    error: str | None = None
+
+
+class BatchUploadResponse(BaseModel):
+    total_files: int
+    success_count: int
+    failed_count: int
+    chunks_indexed: int
+    results: List[BatchUploadItem]
+    message: str
+
+
 class DocumentInfo(BaseModel):
     document_name: str
     chunk_count: int
